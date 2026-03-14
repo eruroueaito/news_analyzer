@@ -52,6 +52,10 @@ class SearchPanel(QWidget):
         self.advanced_options.addItem("仅内容")
         layout.addWidget(self.advanced_options)
     
+    def set_query(self, query: str):
+        """程序化设置搜索词（不触发搜索信号）"""
+        self.search_input.setText(query)
+
     def _on_search(self):
         """处理搜索请求"""
         query = self.search_input.text().strip()
