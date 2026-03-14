@@ -15,7 +15,35 @@ from typing import Callable, Dict, List, Optional, Union, Any
 
 class LLMClient:
     """LLM客户端类"""
-    
+
+    @classmethod
+    def from_profile(cls, profile: str = 'summary') -> 'LLMClient':
+        """
+        从 QSettings 中读取指定配置组创建客户端
+
+        配置键格式：llm/{profile}/api_key、api_url、model
+        若新键不存在，自动回退到旧版单一配置键。
+
+        Args:
+            profile: 配置组名，'summary' / 'analysis' / 'vector'
+
+        Returns:
+            LLMClient 实例
+        """
+        from PyQt5.QtCore import QSettings
+        settings = QSettings("NewsAnalyzer", "NewsAggregator")
+        prefix = f"llm/{profile}"
+
+        api_key = (settings.value(f"{prefix}/api_key", "") or
+                   settings.value("llm/api_key", ""))
+        api_url = (settings.value(f"{prefix}/api_url", "") or
+                   settings.value("llm/api_url",
+                                  "https://api.openai.com/v1/chat/completions"))
+        model = (settings.value(f"{prefix}/model", "") or
+                 settings.value("llm/model_name", "gpt-3.5-turbo"))
+
+        return cls(api_key=api_key, api_url=api_url, model=model)
+
     def __init__(self, api_key=None, api_url=None, model=None):
         """初始化LLM客户端
         
@@ -619,15 +647,21 @@ class LLMClient:
             str: 格式化的HTML
         """
         # 增强HTML格式化
+        formatted = (
+            content
+            .replace('\n\n', '</p><p>')
+            .replace('\n- ', '</p><li>')
+            .replace('\n', '<br>')
+        )
         html = f'''
         <div style="font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; padding: 15px; line-height: 1.5;">
             <h2 style="color: #1976D2; border-bottom: 1px solid #E0E0E0; padding-bottom: 8px;">{analysis_type}结果</h2>
             <div style="padding: 10px 0;">
-                {content.replace('\n\n', '</p><p>').replace('\n- ', '</p><li>').replace('\n', '<br>')}
+                {formatted}
             </div>
         </div>
         '''
-        
+
         return html
     
     def _mock_analysis(self, news_item, analysis_type):

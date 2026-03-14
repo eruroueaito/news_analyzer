@@ -22,17 +22,15 @@ class NewsStorage:
         """
         self.logger = logging.getLogger('news_analyzer.storage')
         
-        # 优先使用绝对路径，兼容运行位置
+        # 跨平台数据目录：优先使用项目内相对路径，回退到用户主目录
         self.app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.data_dir = os.path.join(self.app_root, data_dir)
-        
-        # 如果上述路径不存在，尝试使用绝对路径
+
+        # 如果项目内路径不可用，使用用户主目录下的 .news_analyzer/data
         if not os.path.exists(self.data_dir):
             self.data_dir = os.path.abspath(data_dir)
-            
-        # 如果仍然不存在，尝试使用 C:\Users\Administrator\Desktop\news_analyzer\data
         if not os.path.exists(self.data_dir):
-            self.data_dir = r"C:\Users\Administrator\Desktop\news_analyzer\data"
+            self.data_dir = os.path.join(os.path.expanduser("~"), ".news_analyzer", "data")
         
         # 确保目录存在
         self._ensure_dir(self.data_dir)

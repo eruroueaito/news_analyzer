@@ -11,7 +11,12 @@ import sys
 import os
 import logging
 from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
+
+# 高 DPI 支持（必须在 QApplication 创建之前调用）
+QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
 # 确保项目根目录在Python路径中
 project_root = os.path.dirname(os.path.abspath(__file__))

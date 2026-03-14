@@ -31,17 +31,13 @@ class HistoryPanel(QWidget):
         # 初始化状态标签（提前创建防止错误）
         self.status_label = QLabel("就绪")
         
-        # 显式设置新闻数据存储目录路径
-        self.news_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'data', 'news')
+        # 从 storage 对象获取数据目录（跨平台兼容）
+        self.news_dir = os.path.join(storage.data_dir, "news")
         if not os.path.exists(self.news_dir):
-            # 备选路径 - 直接使用绝对路径
-            self.news_dir = r"C:\Users\Administrator\Desktop\news_analyzer\data\news"
-            if not os.path.exists(self.news_dir):
-                # 如果仍不存在，创建该目录
-                try:
-                    os.makedirs(self.news_dir, exist_ok=True)
-                except Exception as e:
-                    self.logger.error(f"创建目录失败: {str(e)}")
+            try:
+                os.makedirs(self.news_dir, exist_ok=True)
+            except Exception as e:
+                self.logger.error(f"创建目录失败: {str(e)}")
         
         self.logger.info(f"历史新闻目录: {self.news_dir}")
         
