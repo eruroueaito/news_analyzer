@@ -1,361 +1,382 @@
+# -*- coding: utf-8 -*-
 """
-语言模型设置对话框
+语言模型设置对话框（多 API 配置版）
 
-提供配置LLM API的界面，支持OpenAI等多种API格式。
+支持为摘要、分析、向量处理分别配置不同的 API 端点和认证方式。
+认证方式支持 Bearer Token、API Key Header（Anthropic 风格）、自定义 Header。
 """
 
 import os
 import logging
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, 
-                            QLineEdit, QComboBox, QPushButton, QLabel, 
-                            QMessageBox, QGroupBox, QCheckBox, QTabWidget,
-                            QWidget)  # Added QWidget import
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+                             QLineEdit, QComboBox, QPushButton, QLabel,
+                             QMessageBox, QGroupBox, QCheckBox, QTabWidget,
+                             QWidget)
 from PyQt5.QtCore import QSettings, Qt
-from PyQt5.QtGui import QIcon
 
 
-class LLMSettingsDialog(QDialog):
-    """语言模型设置对话框"""
-    
-    def __init__(self, parent=None):
+# ---------------------------------------------------------------------------
+# 单个 API 配置面板（可复用于摘要/分析/向量三个 Tab）
+# ---------------------------------------------------------------------------
+class APIConfigPanel(QWidget):
+    """单个 API 端点的配置面板
+
+    包含 URL、Key、Model、认证方式、预设按钮等控件。
+    """
+
+    def __init__(self, config_prefix: str, parent=None):
+        """
+        Args:
+            config_prefix: QSettings 中的键前缀，如 'llm/summary'
+        """
         super().__init__(parent)
-        
-        self.logger = logging.getLogger('news_analyzer.ui.llm_settings')
-        
-        self.setWindowTitle("语言模型设置")
-        self.setMinimumWidth(550)
-        self.setMinimumHeight(400)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        
+        self.config_prefix = config_prefix
         self._init_ui()
-        self._load_settings()
-    
+
     def _init_ui(self):
-        """初始化UI"""
-        # 创建主布局
         layout = QVBoxLayout(self)
-        layout.setSpacing(15)
-        
-        # 标签页
-        tabs = QTabWidget()
-        
-        # ==========基本设置标签页==========
-        basic_tab = QWidget()
-        basic_layout = QVBoxLayout(basic_tab)
-        basic_layout.setSpacing(15)
-        
-        # 创建API设置组
-        api_group = QGroupBox("API设置")
-        api_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        layout.setSpacing(12)
+
+        # ---- API 设置组 ----
+        api_group = QGroupBox("API 设置")
         api_layout = QFormLayout()
-        api_layout.setSpacing(10)
+        api_layout.setSpacing(8)
         api_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        
-        # API URL
+
         self.api_url = QLineEdit()
         self.api_url.setPlaceholderText("例如: https://api.openai.com/v1/chat/completions")
-        api_layout.addRow("API端点URL:", self.api_url)
-        
-        # API密钥
+        api_layout.addRow("API 端点 URL:", self.api_url)
+
         self.api_key = QLineEdit()
         self.api_key.setEchoMode(QLineEdit.Password)
-        self.api_key.setPlaceholderText("输入API密钥")
-        api_layout.addRow("API密钥:", self.api_key)
-        
-        # 模型名称
+        self.api_key.setPlaceholderText("输入 API 密钥")
+        api_layout.addRow("API 密钥:", self.api_key)
+
         self.model_name = QLineEdit()
-        self.model_name.setPlaceholderText("例如: gpt-3.5-turbo")
+        self.model_name.setPlaceholderText("例如: gpt-4o")
         api_layout.addRow("模型名称:", self.model_name)
-        
-        # 保存API密钥选项
-        self.save_key = QCheckBox("保存API密钥 (注意：密钥将以明文存储)")
-        self.save_key.setToolTip("选中后，API密钥将保存在本地配置中")
+
+        # 认证方式下拉
+        self.auth_type = QComboBox()
+        self.auth_type.addItem("Bearer Token", "bearer_token")
+        self.auth_type.addItem("API Key Header (Anthropic)", "api_key_header")
+        self.auth_type.addItem("自定义 Header", "custom_header")
+        self.auth_type.currentIndexChanged.connect(self._on_auth_type_changed)
+        api_layout.addRow("认证方式:", self.auth_type)
+
+        # 自定义 Header 名（仅 custom_header 模式可见）
+        self.custom_header_name = QLineEdit()
+        self.custom_header_name.setPlaceholderText("例如: X-Custom-Auth")
+        self.custom_header_name.setVisible(False)
+        self.custom_header_label = QLabel("Header 名:")
+        self.custom_header_label.setVisible(False)
+        api_layout.addRow(self.custom_header_label, self.custom_header_name)
+
+        self.save_key = QCheckBox("保存 API 密钥（明文存储）")
         api_layout.addRow("", self.save_key)
-        
+
         api_group.setLayout(api_layout)
-        basic_layout.addWidget(api_group)
-        
-        # 预设模型组
+        layout.addWidget(api_group)
+
+        # ---- 预设模型组 ----
         presets_group = QGroupBox("预设模型")
-        presets_group.setStyleSheet("QGroupBox { font-weight: bold; }")
-        presets_layout = QVBoxLayout()
+        presets_layout = QHBoxLayout()
         presets_layout.setSpacing(8)
-        
-        # 创建预设按钮样式
-        preset_button_style = """
-            QPushButton {
-                padding: 8px;
-                border-radius: 4px;
-                background-color: #f0f0f0;
-                border: 1px solid #ccc;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background-color: #e0e0e0;
-            }
-            QPushButton:pressed {
-                background-color: #d0d0d0;
-            }
-        """
-        
-        # 预设模型按钮
-        openai_button = QPushButton("OpenAI GPT-3.5-Turbo")
-        openai_button.setStyleSheet(preset_button_style)
-        openai_button.clicked.connect(self._use_openai_preset)
-        presets_layout.addWidget(openai_button)
-        
-        openai_button_4 = QPushButton("OpenAI GPT-4o")
-        openai_button_4.setStyleSheet(preset_button_style)
-        openai_button_4.clicked.connect(self._use_openai_4_preset)
-        presets_layout.addWidget(openai_button_4)
-        
-        claude_button = QPushButton("Anthropic Claude")
-        claude_button.setStyleSheet(preset_button_style)
-        claude_button.clicked.connect(self._use_claude_preset)
-        presets_layout.addWidget(claude_button)
-        
-        local_button = QPushButton("本地模型 (Ollama)")
-        local_button.setStyleSheet(preset_button_style)
-        local_button.clicked.connect(self._use_local_preset)
-        presets_layout.addWidget(local_button)
-        
+
+        for name, slot in [
+            ("OpenAI GPT-4o", self._preset_openai_4o),
+            ("GPT-3.5", self._preset_openai_35),
+            ("Claude", self._preset_claude),
+            ("Ollama", self._preset_ollama),
+        ]:
+            btn = QPushButton(name)
+            btn.clicked.connect(slot)
+            presets_layout.addWidget(btn)
+
         presets_group.setLayout(presets_layout)
-        basic_layout.addWidget(presets_group)
-        
-        # 添加弹性空间
-        basic_layout.addStretch(1)
-        
-        # ==========高级设置标签页==========
+        layout.addWidget(presets_group)
+
+        layout.addStretch()
+
+    # ---- 认证方式切换 ----
+    def _on_auth_type_changed(self, index):
+        is_custom = self.auth_type.currentData() == "custom_header"
+        self.custom_header_name.setVisible(is_custom)
+        self.custom_header_label.setVisible(is_custom)
+
+    # ---- 预设填充 ----
+    def _preset_openai_4o(self):
+        self.api_url.setText("https://api.openai.com/v1/chat/completions")
+        self.model_name.setText("gpt-4o")
+        self.auth_type.setCurrentIndex(0)  # Bearer Token
+
+    def _preset_openai_35(self):
+        self.api_url.setText("https://api.openai.com/v1/chat/completions")
+        self.model_name.setText("gpt-3.5-turbo")
+        self.auth_type.setCurrentIndex(0)
+
+    def _preset_claude(self):
+        self.api_url.setText("https://api.anthropic.com/v1/messages")
+        self.model_name.setText("claude-sonnet-4-20250514")
+        self.auth_type.setCurrentIndex(1)  # API Key Header
+
+    def _preset_ollama(self):
+        self.api_url.setText("http://localhost:11434/api/chat")
+        self.model_name.setText("llama3")
+        self.auth_type.setCurrentIndex(0)
+
+    # ---- 加载 / 保存 ----
+    def load_from_settings(self, settings: QSettings):
+        """从 QSettings 加载配置"""
+        p = self.config_prefix
+        self.api_url.setText(settings.value(f"{p}/api_url", ""))
+        self.model_name.setText(settings.value(f"{p}/model_name", ""))
+
+        save_key = settings.value(f"{p}/save_key", False, type=bool)
+        self.save_key.setChecked(save_key)
+        if save_key:
+            self.api_key.setText(settings.value(f"{p}/api_key", ""))
+
+        auth = settings.value(f"{p}/auth_type", "bearer_token")
+        idx = self.auth_type.findData(auth)
+        if idx >= 0:
+            self.auth_type.setCurrentIndex(idx)
+
+        self.custom_header_name.setText(settings.value(f"{p}/custom_header", ""))
+
+    def save_to_settings(self, settings: QSettings):
+        """将配置保存到 QSettings"""
+        p = self.config_prefix
+        settings.setValue(f"{p}/api_url", self.api_url.text())
+        settings.setValue(f"{p}/model_name", self.model_name.text())
+        settings.setValue(f"{p}/save_key", self.save_key.isChecked())
+        settings.setValue(f"{p}/auth_type", self.auth_type.currentData())
+        settings.setValue(f"{p}/custom_header", self.custom_header_name.text())
+
+        if self.save_key.isChecked():
+            settings.setValue(f"{p}/api_key", self.api_key.text())
+        else:
+            settings.remove(f"{p}/api_key")
+
+    def get_config(self) -> dict:
+        """返回当前面板的配置字典"""
+        return {
+            "api_url": self.api_url.text(),
+            "api_key": self.api_key.text(),
+            "model": self.model_name.text(),
+            "auth_type": self.auth_type.currentData(),
+            "custom_header": self.custom_header_name.text(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# LLM 设置对话框（三组 API 配置 + 高级参数）
+# ---------------------------------------------------------------------------
+class LLMSettingsDialog(QDialog):
+    """语言模型设置对话框
+
+    三个 Tab 分别配置：摘要 API、分析 API、向量 API，
+    另有高级参数 Tab（温度、Token 上限、超时等）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.logger = logging.getLogger('news_analyzer.ui.llm_settings')
+
+        self.setWindowTitle("语言模型设置")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(500)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        self._init_ui()
+        self._load_settings()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # ---- 主标签页 ----
+        self.tabs = QTabWidget()
+
+        # 三组 API 配置面板
+        self.summary_panel = APIConfigPanel("llm/summary")
+        self.analysis_panel = APIConfigPanel("llm/analysis")
+        self.vector_panel = APIConfigPanel("llm/vector")
+
+        self.tabs.addTab(self.summary_panel, "摘要 API")
+        self.tabs.addTab(self.analysis_panel, "分析 API")
+        self.tabs.addTab(self.vector_panel, "向量 API")
+
+        # 高级设置 Tab
         advanced_tab = QWidget()
-        advanced_layout = QVBoxLayout(advanced_tab)
-        advanced_layout.setSpacing(15)
-        
-        # 模型参数设置
+        adv_layout = QVBoxLayout(advanced_tab)
+
         params_group = QGroupBox("模型参数")
-        params_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         params_layout = QFormLayout()
-        params_layout.setSpacing(10)
-        
-        # 温度参数
+        params_layout.setSpacing(8)
+
         self.temperature = QLineEdit("0.7")
-        self.temperature.setPlaceholderText("值范围: 0.0-1.0")
-        params_layout.addRow("温度 (Temperature):", self.temperature)
-        
-        # 最大Token
+        self.temperature.setPlaceholderText("范围: 0.0 - 1.0")
+        params_layout.addRow("温度:", self.temperature)
+
         self.max_tokens = QLineEdit("4096")
-        self.max_tokens.setPlaceholderText("例如: 2048")
         params_layout.addRow("最大生成长度:", self.max_tokens)
-        
-        # 系统提示
+
         self.system_prompt = QLineEdit()
         self.system_prompt.setPlaceholderText("为模型设置默认行为的系统提示")
         params_layout.addRow("系统提示:", self.system_prompt)
-        
+
         params_group.setLayout(params_layout)
-        advanced_layout.addWidget(params_group)
-        
-        # API请求设置
-        request_group = QGroupBox("API请求设置")
-        request_group.setStyleSheet("QGroupBox { font-weight: bold; }")
-        request_layout = QFormLayout()
-        request_layout.setSpacing(10)
-        
-        # 超时设置
+        adv_layout.addWidget(params_group)
+
+        request_group = QGroupBox("请求设置")
+        req_layout = QFormLayout()
+        req_layout.setSpacing(8)
+
         self.timeout = QLineEdit("60")
         self.timeout.setPlaceholderText("单位: 秒")
-        request_layout.addRow("请求超时:", self.timeout)
-        
-        # 重试次数
+        req_layout.addRow("请求超时:", self.timeout)
+
         self.retry_count = QLineEdit("3")
-        request_layout.addRow("重试次数:", self.retry_count)
-        
-        request_group.setLayout(request_layout)
-        advanced_layout.addWidget(request_group)
-        
-        # 添加弹性空间
-        advanced_layout.addStretch(1)
-        
-        # 添加标签页
-        tabs.addTab(basic_tab, "基本设置")
-        tabs.addTab(advanced_tab, "高级设置")
-        layout.addWidget(tabs)
-        
-        # 按钮布局
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(10)
-        
-        # 测试连接按钮
+        req_layout.addRow("重试次数:", self.retry_count)
+
+        request_group.setLayout(req_layout)
+        adv_layout.addWidget(request_group)
+        adv_layout.addStretch()
+
+        self.tabs.addTab(advanced_tab, "高级设置")
+        layout.addWidget(self.tabs)
+
+        # ---- 底部按钮 ----
+        btn_layout = QHBoxLayout()
+
         self.test_button = QPushButton("测试连接")
-        self.test_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px 15px;
-                background-color: #4b6eaf;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #3c5c99;
-            }
-            QPushButton:pressed {
-                background-color: #2e4677;
-            }
-        """)
         self.test_button.clicked.connect(self._test_connection)
-        button_layout.addWidget(self.test_button)
-        
-        # 占位空间
-        button_layout.addStretch()
-        
-        # 取消按钮
-        cancel_button = QPushButton("取消")
-        cancel_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px 15px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #f0f0f0;
-            }
-        """)
-        cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_button)
-        
-        # 保存按钮
-        save_button = QPushButton("保存")
-        save_button.setDefault(True)
-        save_button.setStyleSheet("""
-            QPushButton {
-                padding: 8px 15px;
-                background-color: #4CAF50;
-                color: white;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-        """)
-        save_button.clicked.connect(self.accept)
-        button_layout.addWidget(save_button)
-        
-        layout.addLayout(button_layout)
-    
+        btn_layout.addWidget(self.test_button)
+
+        btn_layout.addStretch()
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        save_btn = QPushButton("保存")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(save_btn)
+
+        layout.addLayout(btn_layout)
+
+    # ------------------------------------------------------------------
+    # 加载 / 保存
+    # ------------------------------------------------------------------
     def _load_settings(self):
-        """加载设置"""
         settings = QSettings("NewsAnalyzer", "NewsAggregator")
-        
-        self.api_url.setText(settings.value("llm/api_url", ""))
-        if settings.value("llm/save_key", False, type=bool):
-            self.api_key.setText(settings.value("llm/api_key", ""))
-            self.save_key.setChecked(True)
-        
-        self.model_name.setText(settings.value("llm/model_name", ""))
+
+        # 加载三组 API 配置
+        self.summary_panel.load_from_settings(settings)
+        self.analysis_panel.load_from_settings(settings)
+        self.vector_panel.load_from_settings(settings)
+
+        # 兼容旧版单一配置：如果新键不存在，从旧键迁移
+        if not settings.value("llm/summary/api_url"):
+            old_url = settings.value("llm/api_url", "")
+            old_key = settings.value("llm/api_key", "")
+            old_model = settings.value("llm/model_name", "")
+            if old_url:
+                self.summary_panel.api_url.setText(old_url)
+                self.summary_panel.api_key.setText(old_key)
+                self.summary_panel.model_name.setText(old_model)
+                # 分析配置也用同一个
+                self.analysis_panel.api_url.setText(old_url)
+                self.analysis_panel.api_key.setText(old_key)
+                self.analysis_panel.model_name.setText(old_model)
+
+        # 高级设置
         self.temperature.setText(settings.value("llm/temperature", "0.7"))
-        self.max_tokens.setText(settings.value("llm/max_tokens", "2048"))
+        self.max_tokens.setText(settings.value("llm/max_tokens", "4096"))
         self.system_prompt.setText(settings.value("llm/system_prompt", ""))
         self.timeout.setText(settings.value("llm/timeout", "60"))
         self.retry_count.setText(settings.value("llm/retry_count", "3"))
-    
+
     def save_settings(self):
-        """保存设置"""
+        """保存所有设置到 QSettings 并设置环境变量"""
         settings = QSettings("NewsAnalyzer", "NewsAggregator")
-        
-        # 保存基本设置
-        settings.setValue("llm/api_url", self.api_url.text())
-        settings.setValue("llm/model_name", self.model_name.text())
-        settings.setValue("llm/save_key", self.save_key.isChecked())
-        if self.save_key.isChecked():
-            settings.setValue("llm/api_key", self.api_key.text())
-        else:
-            settings.remove("llm/api_key")
-        
+
+        # 保存三组 API 配置
+        self.summary_panel.save_to_settings(settings)
+        self.analysis_panel.save_to_settings(settings)
+        self.vector_panel.save_to_settings(settings)
+
         # 保存高级设置
         settings.setValue("llm/temperature", self.temperature.text())
         settings.setValue("llm/max_tokens", self.max_tokens.text())
         settings.setValue("llm/system_prompt", self.system_prompt.text())
         settings.setValue("llm/timeout", self.timeout.text())
         settings.setValue("llm/retry_count", self.retry_count.text())
-        
-        # 设置环境变量
-        os.environ["LLM_API_URL"] = self.api_url.text()
-        os.environ["LLM_API_KEY"] = self.api_key.text()
-        os.environ["LLM_MODEL"] = self.model_name.text()
-        
-        self.logger.info("已保存LLM设置")
-    
-    def get_settings(self):
-        """获取设置值
-        
+
+        # 向后兼容：将摘要 API 同步到旧环境变量
+        summary_cfg = self.summary_panel.get_config()
+        os.environ["LLM_API_URL"] = summary_cfg["api_url"]
+        os.environ["LLM_API_KEY"] = summary_cfg["api_key"]
+        os.environ["LLM_MODEL"] = summary_cfg["model"]
+
+        self.logger.info("已保存 LLM 多 API 设置")
+
+    def get_all_configs(self) -> dict:
+        """返回所有配置
+
         Returns:
-            dict: 设置值字典
+            dict 包含 summary、analysis、vector 三组配置及高级参数
         """
         return {
-            "api_url": self.api_url.text(),
-            "api_key": self.api_key.text(),
-            "model_name": self.model_name.text(),
+            "summary": self.summary_panel.get_config(),
+            "analysis": self.analysis_panel.get_config(),
+            "vector": self.vector_panel.get_config(),
             "temperature": float(self.temperature.text() or "0.7"),
-            "max_tokens": int(self.max_tokens.text() or "2048"),
+            "max_tokens": int(self.max_tokens.text() or "4096"),
             "system_prompt": self.system_prompt.text(),
             "timeout": int(self.timeout.text() or "60"),
-            "retry_count": int(self.retry_count.text() or "3")
+            "retry_count": int(self.retry_count.text() or "3"),
         }
-    
-    def _use_openai_preset(self):
-        """使用OpenAI GPT-3.5预设"""
-        self.api_url.setText("https://api.openai.com/v1/chat/completions")
-        self.model_name.setText("gpt-3.5-turbo")
-        self.system_prompt.setText("你是一个专业的新闻分析助手，可以提供客观、全面的新闻分析和解读。")
-    
-    def _use_openai_4_preset(self):
-        """使用OpenAI GPT-4预设"""
-        self.api_url.setText("https://api.openai.com/v1/chat/completions")
-        self.model_name.setText("gpt-4o")
-        self.system_prompt.setText("你是一个专业的新闻分析助手，可以提供客观、全面的新闻分析和解读。")
-    
-    def _use_claude_preset(self):
-        """使用Claude预设"""
-        self.api_url.setText("https://api.anthropic.com/v1/messages")
-        self.model_name.setText("claude-3-opus-20240229")
-        self.system_prompt.setText("你是一个专业的新闻分析助手，可以提供客观、全面的新闻分析和解读。")
-    
-    def _use_local_preset(self):
-        """使用本地模型预设"""
-        self.api_url.setText("http://localhost:11434/api/chat")
-        self.model_name.setText("llama3")
-        self.system_prompt.setText("你是一个专业的新闻分析助手，可以提供客观、全面的新闻分析和解读。")
-    
+
+    # ------------------------------------------------------------------
+    # 连接测试
+    # ------------------------------------------------------------------
     def _test_connection(self):
-        """测试API连接"""
+        """测试当前 Tab 对应的 API 连接"""
         from news_analyzer.llm.llm_client import LLMClient
-        
-        api_url = self.api_url.text()
-        api_key = self.api_key.text()
-        model_name = self.model_name.text()
-        
-        if not api_url or not api_key:
-            QMessageBox.warning(self, "输入错误", "请输入API URL和API密钥")
+
+        current_idx = self.tabs.currentIndex()
+        panels = [self.summary_panel, self.analysis_panel, self.vector_panel]
+        if current_idx >= len(panels):
+            QMessageBox.information(self, "提示", "请切换到 API 配置标签页再测试")
             return
-        
+
+        panel = panels[current_idx]
+        cfg = panel.get_config()
+
+        if not cfg["api_url"] or not cfg["api_key"]:
+            QMessageBox.warning(self, "输入错误", "请输入 API URL 和 API 密钥")
+            return
+
         self.test_button.setEnabled(False)
         self.test_button.setText("正在测试...")
-        
+
         try:
-            # 创建临时客户端进行测试
-            client = LLMClient(api_key=api_key, api_url=api_url, model=model_name)
+            client = LLMClient(
+                api_key=cfg["api_key"],
+                api_url=cfg["api_url"],
+                model=cfg["model"]
+            )
             result = client.test_connection()
-            
-            self.test_button.setEnabled(True)
-            self.test_button.setText("测试连接")
-            
+
             if result:
-                QMessageBox.information(self, "连接成功", "已成功连接到API服务！")
+                QMessageBox.information(self, "连接成功", "已成功连接到 API 服务！")
             else:
-                QMessageBox.warning(self, "连接失败", "无法连接到API服务，请检查设置。")
-        
+                QMessageBox.warning(self, "连接失败", "无法连接到 API，请检查设置。")
         except Exception as e:
+            QMessageBox.critical(self, "连接错误", f"测试时发生错误:\n{str(e)}")
+        finally:
             self.test_button.setEnabled(True)
             self.test_button.setText("测试连接")
-            QMessageBox.critical(self, "连接错误", f"测试连接时发生错误:\n{str(e)}")

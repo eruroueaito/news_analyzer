@@ -1,3 +1,11 @@
 # 基础依赖
 PyQt5>=5.15.0
 requests>=2.25.0
+
+# 可视化
+pyqtgraph>=0.14.0            # 高性能折线图（话题频率趋势）
+squarify>=0.4.0               # Treemap 布局算法
+
+# 文本处理与向量化
+scikit-learn>=1.0.0           # TF-IDF 向量化 + KMeans 聚类
+jieba>=0.42.0                 # 中文分词
