@@ -32,6 +32,7 @@ class TopicDetailPanel(QWidget):
 
     news_item_selected = pyqtSignal(dict)
     bookmark_toggled = pyqtSignal(str)
+    back_requested = pyqtSignal()
 
     def __init__(self, bookmark_store: BookmarkStore,
                  parent: Optional[QWidget] = None):
@@ -50,8 +51,13 @@ class TopicDetailPanel(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        # ---- 顶部：关键词 + 热度标签 + 收藏按钮 ----
+        # ---- 顶部：返回按钮 + 关键词 + 热度标签 + 收藏按钮 ----
         header = QHBoxLayout()
+
+        self._back_btn = QPushButton("← 返回")
+        self._back_btn.setFixedWidth(72)
+        self._back_btn.clicked.connect(self.back_requested)
+        header.addWidget(self._back_btn)
 
         self._keyword_label = QLabel("—")
         kw_font = QFont()
@@ -195,7 +201,7 @@ class TopicDetailPanel(QWidget):
         border = tm.get_color_hex('border')
 
         self._heat_badge.setStyleSheet(
-            f"background-color: {accent}22; color: {accent}; "
+            f"background-color: {accent}; color: #ffffff; "
             f"border: 1px solid {accent}; border-radius: 14px; "
             f"font-size: 11px; font-weight: bold;"
         )

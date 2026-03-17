@@ -27,37 +27,43 @@ class RSSCollector:
         self.ssl_context.check_hostname = False
         self.ssl_context.verify_mode = ssl.CERT_NONE
     
-    def add_source(self, url, name=None, category="未分类", is_user_added=False):
+    def add_source(self, url, name=None, category="未分类", is_user_added=False, lang=None):
         """添加RSS新闻源
-        
+
         Args:
             url: RSS源URL
             name: 来源名称（可选）
             category: 分类名称（可选）
             is_user_added: 是否为用户手动添加
+            lang: 内容语言 'zh' 或 'en'（可选，不传则自动检测）
         """
         if not url:
             raise ValueError("URL不能为空")
-        
+
         # 如果没有提供名称，使用URL作为默认名称
         if not name:
             name = url.split("//")[-1].split("/")[0]
-        
+
+        # 自动检测语言：若名称包含中文字符则判定为中文源
+        if lang is None:
+            lang = 'zh' if any('\u4e00' <= c <= '\u9fff' for c in name) else 'en'
+
         # 检查是否已存在相同URL的源
         for source in self.sources:
             if source['url'] == url:
                 self.logger.warning(f"RSS源已存在: {url}")
                 return
-        
+
         # 添加新源
         self.sources.append({
             'url': url,
             'name': name,
             'category': category,
-            'is_user_added': is_user_added
+            'is_user_added': is_user_added,
+            'lang': lang,
         })
-        
-        self.logger.info(f"添加RSS源: {name} ({url}), 分类: {category}")
+
+        self.logger.info(f"添加RSS源: {name} ({url}), 分类: {category}, 语言: {lang}")
     
     def fetch_from_source(self, url):
         """从特定RSS源获取新闻
@@ -104,6 +110,40 @@ class RSSCollector:
         
         return unique_news
     
+    def fetch_all_progressive(self, on_source_done, seed_items=None):
+        """从所有RSS源逐一获取新闻，每完成一个源就回调一次。
+
+        Args:
+            on_source_done: 可调用对象，签名 on_source_done(news_items: list)
+                            每次传入截至目前已去重的全量新闻列表。
+            seed_items: 可选的初始新闻列表（如今日缓存），新条目将追加其后，
+                        重复标题的条目由 _remove_duplicates 自动过滤。
+
+        Returns:
+            list: 最终去重后的全量新闻列表
+        """
+        all_news: list = list(seed_items) if seed_items else []
+        unique_news: list = list(all_news)  # 初始值即缓存（已去重）
+
+        for source in self.sources:
+            try:
+                items = self._fetch_rss(source)
+                all_news.extend(items)
+                self.logger.info(f"从 {source['name']} 获取了 {len(items)} 条新闻")
+            except Exception as e:
+                self.logger.error(f"从 {source['name']} 获取新闻失败: {str(e)}")
+
+            # 每完成一个源，去重后立即通知调用方；保留引用供最终返回
+            unique_news = self._remove_duplicates(all_news)
+            try:
+                on_source_done(unique_news)
+            except Exception as e:
+                self.logger.error(f"on_source_done 回调失败: {str(e)}")
+
+        # 最后一次 unique_news 已是全量去重结果，无需再次调用 _remove_duplicates
+        self.news_cache = unique_news
+        return unique_news
+
     def get_all_news(self):
         """获取所有缓存的新闻
         
@@ -265,13 +305,14 @@ class RSSCollector:
                 'source_name': source['name'],
                 'source_url': source['url'],
                 'category': source['category'],
+                'lang': source.get('lang', 'en'),
                 'collected_at': time.strftime('%Y-%m-%d %H:%M:%S')
             }
-            
+
         except Exception as e:
             self.logger.error(f"解析RSS条目失败: {str(e)}")
             return None
-    
+
     def _parse_atom_entry(self, entry, source):
         """解析Atom条目
         
@@ -328,6 +369,7 @@ class RSSCollector:
                 'source_name': source['name'],
                 'source_url': source['url'],
                 'category': source['category'],
+                'lang': source.get('lang', 'en'),
                 'collected_at': time.strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -335,6 +377,24 @@ class RSSCollector:
             self.logger.error(f"解析Atom条目失败: {str(e)}")
             return None
     
+    def update_source_url(self, old_url: str, new_url: str) -> bool:
+        """更新RSS源的URL
+
+        Args:
+            old_url: 旧的URL
+            new_url: 新的URL
+
+        Returns:
+            bool: 是否成功更新
+        """
+        for source in self.sources:
+            if source['url'] == old_url:
+                source['url'] = new_url
+                self.logger.info(f"更新RSS源 URL: {old_url} → {new_url}")
+                return True
+        self.logger.warning(f"未找到要更新的RSS源: {old_url}")
+        return False
+
     def _remove_duplicates(self, news_items):
         """移除重复的新闻条目
         
@@ -344,12 +404,15 @@ class RSSCollector:
         Returns:
             list: 去重后的新闻条目列表
         """
-        unique_items = {}
-        
+        unique_items: dict = {}
+
         for item in news_items:
-            # 使用标题作为去重键
-            key = item.get('title', '')
-            if key and key not in unique_items:
+            raw = item.get('title', '')
+            if not raw:
+                continue
+            # 规范化后去重：小写 + 合并空白，避免大小写/空格差异导致同一标题重复入库
+            key = ' '.join(raw.lower().split())
+            if key not in unique_items:
                 unique_items[key] = item
-        
+
         return list(unique_items.values())

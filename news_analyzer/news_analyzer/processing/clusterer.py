@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from math import sqrt
 from typing import Any
 
@@ -46,6 +47,26 @@ CLUSTER_COLOR_PALETTE: list[str] = [
     "#7209B7",  # 深紫色 - 神秘高贵
     "#3A86A7",  # 钢蓝色 - 冷静专业
 ]
+
+
+def _dedup_prefix_keywords(keywords: list[str]) -> list[str]:
+    """
+    移除关键词列表中的近似重复词。
+
+    若词 B 以词 A 开头（且 A 长度 >= 4），则认为 B 是 A 的派生形式，
+    保留 A（较短/更通用），丢弃 B。例如：
+        ["america", "american"] → ["america"]
+        ["iran", "iranian"]     → ["iran"]
+    """
+    result: list[str] = []
+    for kw in keywords:
+        dominated = any(
+            len(existing) >= 4 and kw.startswith(existing) and kw != existing
+            for existing in result
+        )
+        if not dominated:
+            result.append(kw)
+    return result
 
 
 class NewsClusterer:
@@ -235,6 +256,13 @@ class NewsClusterer:
             if center[sorted_indices[i]] > 0  # 仅保留有实际贡献的关键词
         ]
 
+        # 去除近似重复词（如 america / american，iran / iranian）
+        # 若某词是另一词的前缀（前缀长度 ≥ 4），则保留较短的那个
+        all_kws = [primary_keyword] + related_keywords
+        all_kws = _dedup_prefix_keywords(all_kws)
+        primary_keyword = all_kws[0] if all_kws else primary_keyword
+        related_keywords = all_kws[1:]
+
         return primary_keyword, related_keywords
 
     def _calculate_heat(self, news_items_in_cluster: list[dict]) -> float:
@@ -306,13 +334,17 @@ class NewsClusterer:
                 continue
 
             try:
-                # 尝试解析 ISO 8601 格式的日期字符串
-                if isinstance(pub_date_str, str):
-                    # 处理多种常见日期格式
-                    pub_date_str = pub_date_str.replace("Z", "+00:00")
-                    pub_date = datetime.fromisoformat(pub_date_str)
-                elif isinstance(pub_date_str, datetime):
+                if isinstance(pub_date_str, datetime):
                     pub_date = pub_date_str
+                elif isinstance(pub_date_str, str):
+                    # 优先尝试 ISO 8601（Atom 格式：2026-03-17T12:00:00Z）
+                    try:
+                        pub_date = datetime.fromisoformat(
+                            pub_date_str.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        # 回退到 RFC 2822（RSS 格式：Mon, 17 Mar 2026 12:00:00 GMT）
+                        pub_date = parsedate_to_datetime(pub_date_str)
                 else:
                     weights.append(0.5)
                     continue
