@@ -7,7 +7,8 @@
 标题、来源、日期、摘要/正文（HTML 渲染），以及"分析"与"打开原文"按钮。
 """
 
-from typing import Optional, Dict
+import re
+from typing import Optional, Dict, List
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -124,12 +125,7 @@ class NewsReaderWidget(QWidget):
             f"<b>{source}</b>  ·  {date}" if source else date
         )
 
-        # 渲染正文（保留来自 RSS 的基本 HTML，去除脚本标签）
-        safe_html = self._sanitize_html(description)
-        if safe_html.strip():
-            self._content.setHtml(safe_html)
-        else:
-            self._content.setPlainText("（无摘要内容）")
+        self._render_content(description)
 
         # 切换可见性
         self._empty_label.setVisible(False)
@@ -143,6 +139,28 @@ class NewsReaderWidget(QWidget):
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+
+    def _render_content(self, text: str):
+        """渲染正文内容，自动检测 HTML / 纯文本并应用段落排版。"""
+        if not text.strip():
+            self._content.setPlainText("（无摘要内容）")
+            return
+
+        # QTextDocument.setDefaultStyleSheet 支持 line-height（与 QSS 不同）
+        # 必须在 setHtml 之前设置；Qt 保证持久生效
+        self._content.document().setDefaultStyleSheet(
+            "body { line-height: 1.7; }"
+            "p { margin-top: 0; margin-bottom: 0.9em; }"
+        )
+
+        if re.search(r'<[a-zA-Z][^>]*>', text):
+            # 含 HTML 标签：清理后直接渲染
+            self._content.setHtml(self._sanitize_html(text))
+        else:
+            # 纯文本：分段后包裹 <p> 渲染
+            paragraphs = self._split_paragraphs(text)
+            html = ''.join(f'<p>{self._escape_html(p)}</p>' for p in paragraphs)
+            self._content.setHtml(html)
 
     def _show_empty(self):
         self._empty_label.setVisible(True)
@@ -158,15 +176,65 @@ class NewsReaderWidget(QWidget):
             if link:
                 QDesktopServices.openUrl(QUrl(link))
 
+    # ------------------------------------------------------------------
+    # 静态工具方法
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _split_paragraphs(text: str, min_para_chars: int = 150) -> List[str]:
+        """将纯文本拆分为可读段落。
+
+        策略（按优先级）：
+        1. 双换行 \\n\\n → 直接分段
+        2. 单换行 \\n → 每行为一段
+        3. 无换行（RSS 典型情况）：按中文句末标点 + 空白分句，
+           再将短句合并为 ≥ min_para_chars 字的段落
+        """
+        if '\n\n' in text:
+            return [p.strip() for p in text.split('\n\n') if p.strip()]
+
+        if '\n' in text:
+            return [line.strip() for line in text.split('\n') if line.strip()]
+
+        # 按句末标点 + 空白切分
+        sentences = [s.strip()
+                     for s in re.split(r'(?<=[。？！…])\s+', text)
+                     if s.strip()]
+        if len(sentences) <= 1:
+            return [text]
+
+        # 将短句合并为段落
+        paragraphs: List[str] = []
+        buf = ''
+        for sent in sentences:
+            if not buf:
+                buf = sent
+            elif len(buf) < min_para_chars:
+                buf += sent          # 句末已有标点，直接拼接
+            else:
+                paragraphs.append(buf)
+                buf = sent
+        if buf:
+            paragraphs.append(buf)
+        return paragraphs
+
     @staticmethod
     def _sanitize_html(html: str) -> str:
         """移除 <script>/<style> 标签，保留其他 HTML"""
-        import re
         html = re.sub(r'<script[^>]*>.*?</script>', '', html,
                       flags=re.DOTALL | re.IGNORECASE)
         html = re.sub(r'<style[^>]*>.*?</style>', '', html,
                       flags=re.DOTALL | re.IGNORECASE)
         return html
+
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        """转义纯文本中的 HTML 特殊字符，避免 setHtml 误解析"""
+        return (text
+                .replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('"', '&quot;'))
 
     def _apply_theme(self, is_dark: bool = False):
         tm = ThemeManager.instance()
@@ -181,11 +249,16 @@ class NewsReaderWidget(QWidget):
         self._empty_label.setStyleSheet(
             f"color: {text_sec}; font-size: 13px;"
         )
-        # QTextBrowser: 使用正确的颜色键；Qt 不支持 line-height，去掉它
+        # QTextBrowser widget 级 QSS（不支持 line-height，段落 CSS 通过 document 设置）
         self._content.setStyleSheet(
             f"QTextBrowser {{"
             f"  background-color: {bg_card}; color: {text_main}; "
             f"  border: 1px solid {border}; border-radius: 4px; "
             f"  padding: 8px; font-size: 13px;"
             f"}}"
+        )
+        # 主题切换时同步更新 document 样式（颜色无关，仅排版）
+        self._content.document().setDefaultStyleSheet(
+            "body { line-height: 1.7; }"
+            "p { margin-top: 0; margin-bottom: 0.9em; }"
         )

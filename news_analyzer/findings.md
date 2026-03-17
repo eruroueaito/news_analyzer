@@ -98,3 +98,37 @@ def _on_news_selected(self, news_item):
 ```
 
 改造后需要新增：`self.news_reader.set_news(news_item)` 并切换 stacked widget 到阅读页面（仅当用户没有主动切到分析模式时）。
+
+---
+
+## F9 — NewsReaderWidget 内容无分段的根因
+
+**调查日期**：2026-03-17
+
+### 数据特征（实测）
+
+| 来源 | HTML 标签 | `\n` 换行 | 长度 |
+|------|-----------|-----------|------|
+| BBC中文网 | ✗ | 0 | 3007 |
+| FT中文网  | ✗ | 0 | 63   |
+| Solidot  | ✗ | 0 | 218  |
+
+RSS `description` 字段经过抓取器处理后已为**纯文本、无换行、无 HTML 标签**。
+
+### 为何显示为一整块
+
+- `set_news()` 中：`safe_html = self._sanitize_html(description)` → description 本身无 HTML 标签，函数直接返回原字符串
+- `self._content.setHtml(safe_html)` 把纯文本当 HTML 渲染 → HTML 渲染器将所有连续空白折叠为单个空格 → 整段文字连成一块
+
+### 正确修复思路
+
+1. **检测内容类型**：`re.search(r'<[a-zA-Z][^>]*>', text)` 判断是否含 HTML 标签
+2. **纯文本路径**：按中文句末标点（`。？！…`）+ 空白分句，然后将短句合并为"段落"（`min_para_chars=150`），包裹 `<p>` 标签后 setHtml
+3. **HTML 路径**：保持现有 `sanitize_html` + `setHtml` 逻辑
+4. **排版 CSS**：用 `document().setDefaultStyleSheet()` 设置 `p { margin-bottom:0.9em }` 和 `body { line-height:1.7 }`
+   - 注意：`QTextDocument.setDefaultStyleSheet()` 支持 `line-height`，与 widget 级 QSS 不同
+   - 必须在 `setHtml()` **之前**调用，或只调用一次（Qt 保证持久生效）
+
+### 测试结果（BBC中文，3007 字符）
+
+算法参数 `min_para_chars=150` → 16 个段落，每段 150–307 字，阅读体验良好。

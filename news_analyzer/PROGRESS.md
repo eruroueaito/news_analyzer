@@ -455,3 +455,27 @@ python -m news_analyzer
 - **阅读器不触发 LLM**：选中新闻只填充阅读器，分析逻辑推迟到用户主动点击"分析"
 - **增量缓存**：`fetch_all_progressive(seed_items=...)` 将缓存条目预填入 `all_news`，新条目追加后统一去重，无需改动去重算法
 - **缓存文件**：`news_today_YYYYMMDD.json`，每次 `_on_fetch_finished` 覆盖写入，3 天旧文件自动清理
+
+---
+
+## 9. 排版修复（2026-03-17 第三轮）
+
+### 问题
+`NewsReaderWidget` 正文显示为一整块文字，无段落分隔。
+
+### 根因（findings.md F9）
+RSS `description` 字段为纯文本（无 HTML 标签、无 `\n` 换行）。`setHtml()` 把纯文本当 HTML 渲染时，HTML 渲染引擎将所有连续空白折叠为单个空格，整段文字连成一块。
+
+### 修复（仅改动 `news_analyzer/ui/news_reader.py`）
+
+| 新增 | 说明 |
+|------|------|
+| `_render_content(text)` | 入口：检测 HTML/纯文本，调用对应路径 |
+| `_split_paragraphs(text, min_para_chars=150)` | 按 `\n\n` → `\n` → 句末标点分句并合并为段落 |
+| `_escape_html(text)` | 转义 `& < > "` 防止纯文本被误解析为 HTML |
+| `document().setDefaultStyleSheet(...)` | `line-height: 1.7; p margin-bottom: 0.9em`（QTextDocument CSS 支持 line-height，QSS 不支持） |
+
+### 效果
+- BBC中文（3007字，无换行）→ 约 16 个段落，有明显段间距
+- FT中文（63字，单句）→ 1 段，正常显示
+- 含 HTML 标签的 RSS 条目 → HTML 路径正常渲染

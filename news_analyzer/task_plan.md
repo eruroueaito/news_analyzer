@@ -95,3 +95,39 @@
 - **缓存粒度**：以"天"为单位（`news_today_YYYYMMDD.json`），不细分到小时，简化逻辑
 - **增量机制**：依靠已有的标题去重实现，不新增"上次抓取时间戳"比对，避免复杂性
 - **badge修复**：改为实心背景而非透明，彻底解决对比度问题，与现有 theme 颜色一致
+
+---
+
+## Phase 5 — 新闻阅读器排版修复（2026-03-17）
+
+### 5.1 修复 NewsReaderWidget 纯文本内容无分段问题
+
+**问题根因**（见 findings.md F9）：RSS description 为纯文本（无 HTML 标签、无换行），`setHtml()` 把它当 HTML 渲染时折叠所有空格，导致文字连成一块。
+
+**修改文件**：`news_analyzer/ui/news_reader.py`（**仅此一文件**）
+
+**新增方法**：
+
+| 方法 | 说明 |
+|------|------|
+| `_render_content(text)` | 统一入口：检测 HTML/纯文本，调用对应渲染路径 |
+| `_split_paragraphs(text, min_para_chars=150)` | 静态方法：纯文本段落检测；优先按 `\n\n`/`\n` 分段；否则按中文句末标点 + 空白分句后，将短句合并为 ≥150 字的段落 |
+| `_escape_html(text)` | 静态方法：转义 `& < > "` |
+
+**修改 `set_news()`**：将 `setHtml`/`setPlainText` 内联调用替换为 `_render_content(description)`
+
+**修改 `_apply_theme()`**：增加 `document().setDefaultStyleSheet(...)` 设置段落间距与行高
+
+```python
+self._content.document().setDefaultStyleSheet(
+    "body { line-height: 1.7; }"
+    "p { margin-top: 0; margin-bottom: 0.9em; }"
+)
+```
+
+**验证**：
+1. 点击 BBC中文网文章 → 右侧显示 ~16 个段落，有明显段间距
+2. 点击 FT中文网（短描述）→ 显示为一整段，无碎裂
+3. 点击有 HTML 标签的条目 → HTML 路径正常渲染，不双重转义
+
+**预期改动量**：约 +50 行，-5 行
