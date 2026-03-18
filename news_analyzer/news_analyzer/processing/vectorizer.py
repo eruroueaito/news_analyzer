@@ -14,11 +14,12 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import jieba
 from scipy.sparse import spmatrix
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +61,100 @@ CHINESE_STOP_WORDS: set[str] = {
     "之", "其", "此", "某", "该", "本", "各种", "任何", "一些",
     "一切", "所有", "其他", "另", "别", "等", "等等", "如此",
     "这样", "那样", "怎样", "如何", "为什么", "什么样",
+    # 月份
+    "一月", "二月", "三月", "四月", "五月", "六月",
+    "七月", "八月", "九月", "十月", "十一月", "十二月",
+    # 新闻叙事套话
+    "表示", "指出", "称", "据", "报道", "消息", "相关",
+    "发布", "发现", "发生", "认为", "表明", "显示", "宣布",
+    "记者", "编辑", "编辑部", "文章", "内容", "方式", "目前",
+    "少数派", "用户", "本文",
     # 标点符号及特殊字符（分词后可能残留）
     ".", ",", "!", "?", ";", ":", "'", '"', "(", ")",
     "。", "，", "！", "？", "；", "：", "'", "'", """, """,
     "（", "）", "【", "】", "《", "》", "、", "…", "——",
     "\n", "\t", " ", "\r",
 }
+
+# 通用英文非实体词（形容词、副词、高频动词、新闻套话等）
+_GENERIC_ENGLISH_STOP_WORDS: set[str] = {
+    # 形容词
+    "new", "old", "big", "top", "best", "free", "good", "great", "high",
+    "low", "long", "short", "open", "small", "large", "full", "real",
+    "latest", "breaking", "major", "key", "hot", "live", "last", "next",
+    "former", "current", "senior", "local", "national", "global",
+    "political", "economic", "military", "federal", "public", "private",
+    # 高频动词
+    "says", "said", "say", "get", "got", "make", "made", "use", "used",
+    "take", "took", "give", "gave", "come", "came", "look", "back",
+    "goes", "went", "run", "running", "put", "puts", "keep", "kept",
+    "show", "shows", "shown", "tell", "told", "call", "calls", "called",
+    "need", "needs", "want", "wants", "help", "helps", "helped",
+    "ask", "asks", "asked", "start", "starts", "started", "end", "ends",
+    # 高频名词（新闻套话）
+    "year", "years", "day", "days", "time", "times", "week", "weeks",
+    "month", "months", "way", "part", "place", "case", "world", "report",
+    "people", "man", "men", "woman", "women", "group", "set", "number",
+    "plan", "plans", "deal", "deals", "move", "moves", "step", "steps",
+    "news", "read", "more", "work", "works", "life", "home", "money",
+    "power", "right", "rights", "law", "laws", "policy", "official",
+    "officials", "leader", "leaders", "member", "members", "percent",
+    # 助动词 / 系动词（sklearn ENGLISH_STOP_WORDS 未完全覆盖）
+    "can", "has", "had", "was", "are", "were", "will", "may", "might",
+    "been", "being", "did", "does", "just", "also", "even", "still",
+    "now", "then", "here", "there", "how", "why", "who", "what",
+    "when", "where", "which",
+    # 月份全称
+    "january", "february", "march", "april", "june", "july",
+    "august", "september", "october", "november", "december",
+    # 月份缩写（3字母，通过过滤器但无意义）
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    # 星期全称
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    # 序数词
+    "first", "second", "third", "fourth", "fifth", "sixth",
+    "seventh", "eighth", "ninth", "tenth",
+    # 数量词
+    "million", "billion", "trillion", "hundred", "thousand",
+    # 更多介词/连词/新闻套话
+    "according", "amid", "ahead", "following", "including", "per",
+    "via", "among", "without", "within", "against", "between",
+    "around", "through", "despite", "while", "could", "would", "should",
+    "let", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "many", "much", "few", "less", "more", "most",
+    "every", "each", "any", "some", "other", "others", "own", "same",
+    "after", "before", "over", "under", "than", "like", "want",
+}
+
+# 合并中文、sklearn 内置英文、通用英文停用词（模块级一次性计算）
+ALL_STOP_WORDS: set[str] = CHINESE_STOP_WORDS | set(ENGLISH_STOP_WORDS) | _GENERIC_ENGLISH_STOP_WORDS
+# 预先转为 list 供 TfidfVectorizer 使用（避免每次构造时重复转换）
+_ALL_STOP_WORDS_LIST: list[str] = list(ALL_STOP_WORDS)
+
+# 匹配「有意义的 token」：
+#   - 中文词：至少 2 个汉字
+#   - 英文词：至少 3 个字母（过滤 "a", "an", "is", "of" 等）
+#   - 拒绝纯标点、HTML 实体、单字符、纯数字
+_VALID_TOKEN_RE = re.compile(
+    r'^(?:[\u4e00-\u9fff\u3400-\u4dbf]{2,}|[a-zA-Z]{3,})$'
+)
+
+
+def _tokenize(text: str) -> list[str]:
+    """jieba 分词 + 垃圾 token 过滤"""
+    # 预处理：去除 HTML 实体（&amp; &#160; 等）和多余空白
+    text = re.sub(r'&[a-zA-Z]{2,6};|&#\d+;', ' ', text)
+    tokens = jieba.lcut(text)
+    result = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        # 只保留符合规则的 token（2+ 汉字 或 3+ 英文字母）
+        if _VALID_TOKEN_RE.match(tok):
+            # 英文词统一小写，使 America/american 等归一化
+            result.append(tok.lower() if tok.isascii() else tok)
+    return result
 
 
 class NewsVectorizer:
@@ -98,18 +187,18 @@ class NewsVectorizer:
 
         # 构建 TF-IDF 向量化器
         self._vectorizer = TfidfVectorizer(
-            tokenizer=jieba.lcut,
+            tokenizer=_tokenize,
             max_features=5000,
-            max_df=0.85,
+            max_df=0.5,   # 出现在超过 50% 文档中的词视为通用词，过滤掉
             min_df=2,
-            stop_words=list(CHINESE_STOP_WORDS),
+            stop_words=_ALL_STOP_WORDS_LIST,
             token_pattern=None,  # 使用自定义 tokenizer 时需要禁用默认正则
         )
 
         # 记录是否已经拟合过数据
         self._is_fitted: bool = False
 
-        logger.info("NewsVectorizer 初始化完成（max_features=5000, max_df=0.85, min_df=2）")
+        logger.info("NewsVectorizer 初始化完成（max_features=5000, max_df=0.5, min_df=2）")
 
     def fit_transform(self, news_items: list[dict]) -> spmatrix | None:
         """

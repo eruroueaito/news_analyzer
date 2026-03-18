@@ -176,12 +176,14 @@ class LLMSettingsDialog(QDialog):
     """语言模型设置对话框
 
     三个 Tab 分别配置：摘要 API、分析 API、向量 API，
-    另有高级参数 Tab（温度、Token 上限、超时等）。
+    另有高级参数 Tab（温度、Token 上限、超时等）和 RSS 订阅检测 Tab。
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, rss_collector=None, llm_client=None):
         super().__init__(parent)
         self.logger = logging.getLogger('news_analyzer.ui.llm_settings')
+        self._rss_collector = rss_collector
+        self._llm_client = llm_client
 
         self.setWindowTitle("语言模型设置")
         self.setMinimumWidth(600)
@@ -245,6 +247,18 @@ class LLMSettingsDialog(QDialog):
         adv_layout.addStretch()
 
         self.tabs.addTab(advanced_tab, "高级设置")
+
+        # RSS 订阅检测 Tab
+        if self._rss_collector is not None:
+            try:
+                from news_analyzer.ui.rss_health_panel import RSSHealthPanel
+                self._rss_health_tab = RSSHealthPanel(
+                    self._rss_collector, self._llm_client
+                )
+                self.tabs.addTab(self._rss_health_tab, "RSS订阅检测")
+            except Exception as e:
+                self.logger.warning(f"RSS健康面板加载失败: {e}")
+
         layout.addWidget(self.tabs)
 
         # ---- 底部按钮 ----
@@ -350,7 +364,7 @@ class LLMSettingsDialog(QDialog):
         current_idx = self.tabs.currentIndex()
         panels = [self.summary_panel, self.analysis_panel, self.vector_panel]
         if current_idx >= len(panels):
-            QMessageBox.information(self, "提示", "请切换到 API 配置标签页再测试")
+            QMessageBox.information(self, "提示", "请切换到摘要/分析/向量 API 配置标签页再测试")
             return
 
         panel = panels[current_idx]

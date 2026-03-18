@@ -13,7 +13,7 @@ from typing import List, Dict, Optional
 from collections import defaultdict
 
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QSizePolicy
+    QWidget, QVBoxLayout, QLabel, QSizePolicy, QSplitter
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -56,8 +56,7 @@ class DashboardPanel(QWidget):
         """
         初始化 UI 布局
 
-        创建垂直布局，上方放置 SourceSummaryWidget，下方放置 TreemapWidget。
-        SourceSummaryWidget 使用固定高度，TreemapWidget 填充剩余空间。
+        创建垂直布局，上方放置 SourceSummaryWidget，下方放置左右分割的双 TreemapWidget。
         """
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -68,13 +67,20 @@ class DashboardPanel(QWidget):
         self._source_summary.setFixedHeight(150)
         layout.addWidget(self._source_summary)
 
-        # ---- 话题热度树图（填充剩余空间）----
-        self._treemap = TreemapWidget(self)
-        self._treemap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self._treemap)
+        # ---- 左右分割的双 TreemapWidget ----
+        treemap_splitter = QSplitter(Qt.Horizontal)
 
-        # 将 TreemapWidget 的 topic_clicked 信号转发到本面板
-        self._treemap.topic_clicked.connect(self.topic_clicked)
+        en_container, self._treemap_en = self._create_treemap_container("🌐 英文热点")
+        zh_container, self._treemap_zh = self._create_treemap_container("中文热点")
+        treemap_splitter.addWidget(en_container)
+        treemap_splitter.addWidget(zh_container)
+
+        treemap_splitter.setSizes([1, 1])
+        layout.addWidget(treemap_splitter, 1)
+
+        # 转发两个 treemap 的 topic_clicked 信号
+        self._treemap_en.topic_clicked.connect(self.topic_clicked)
+        self._treemap_zh.topic_clicked.connect(self.topic_clicked)
 
         # ---- 加载状态提示标签（默认隐藏）----
         self._loading_label = QLabel('数据加载中...', self)
@@ -89,19 +95,44 @@ class DashboardPanel(QWidget):
             'border-radius: 8px; padding: 20px;'
         )
 
-    def refresh(self, news_items: List[Dict], clusters: List[Dict]):
+    @staticmethod
+    def _create_treemap_container(header_text: str):
+        """创建带标题的 TreemapWidget 容器
+
+        Args:
+            header_text: 显示在 TreemapWidget 上方的标题文本
+
+        Returns:
+            tuple[QWidget, TreemapWidget]: (容器 widget, 内部 TreemapWidget)
+        """
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        header = QLabel(header_text)
+        header.setAlignment(Qt.AlignCenter)
+        header.setObjectName("treemap_header")
+        layout.addWidget(header)
+
+        treemap = TreemapWidget(container)
+        treemap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(treemap, 1)
+
+        return container, treemap
+
+    def refresh(self, news_items: List[Dict],
+                en_clusters: List[Dict], zh_clusters: List[Dict]):
         """
         刷新仪表盘数据
 
         根据新闻列表计算各类别统计数据，更新 SourceSummaryWidget；
-        将聚类数据传递给 TreemapWidget 进行可视化。
+        将英文/中文聚类数据分别传给对应 TreemapWidget。
 
         Args:
-            news_items: 新闻数据列表，每个字典至少包含：
-                - category (str): 新闻类别
-                - pub_date (str): 发布时间
-                - source (str): 新闻源名称
-            clusters: 聚类数据列表，直接传递给 TreemapWidget
+            news_items: 新闻数据列表
+            en_clusters: 英文新闻聚类数据列表
+            zh_clusters: 中文新闻聚类数据列表
         """
         # 隐藏加载状态
         self.set_loading(False)
@@ -110,8 +141,9 @@ class DashboardPanel(QWidget):
         source_stats = self._calculate_source_stats(news_items)
         self._source_summary.set_data(source_stats)
 
-        # 更新话题热度树图
-        self._treemap.set_data(clusters)
+        # 分别更新英文/中文话题热度树图
+        self._treemap_en.set_data(en_clusters)
+        self._treemap_zh.set_data(zh_clusters)
 
     def _calculate_source_stats(self, news_items: List[Dict]) -> List[Dict]:
         """
@@ -150,9 +182,11 @@ class DashboardPanel(QWidget):
                 # 按字符串排序取最新时间（假设时间格式一致可比较）
                 latest_time = max(times)
 
-            # 收集去重的新闻源
+            # 收集去重的新闻源（字段名为 source_name，兼容旧版 source）
             sources = list(set(
-                item.get('source', '') for item in items if item.get('source')
+                item.get('source_name') or item.get('source', '')
+                for item in items
+                if item.get('source_name') or item.get('source')
             ))
 
             stats.append({

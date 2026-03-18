@@ -24,9 +24,9 @@ from PyQt5.QtWidgets import (
     QSplitter, QAction, QStatusBar, QToolBar,
     QMessageBox, QDialog, QLabel, QLineEdit,
     QPushButton, QFormLayout, QTabWidget, QApplication,
-    QShortcut,
+    QShortcut, QStackedWidget,
 )
-from PyQt5.QtCore import Qt, QSize, QSettings, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QSize, QSettings, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 
 from news_analyzer.ui.sidebar import CategorySidebar
@@ -47,53 +47,77 @@ from news_analyzer.llm.llm_client import LLMClient
 class FetchWorker(QThread):
     """异步 RSS 抓取线程"""
     progress = pyqtSignal(int, int)          # fetched, total
-    finished = pyqtSignal(list)              # news_items
+    items_fetched = pyqtSignal(list)         # 每完成一个源就发出当前全量列表
+    finished = pyqtSignal(list)              # news_items（全部完成后）
     error = pyqtSignal(str)
 
-    def __init__(self, rss_collector, source_url=None, parent=None):
+    def __init__(self, rss_collector, source_url=None, seed_items=None, parent=None):
         super().__init__(parent)
         self._collector = rss_collector
         self._source_url = source_url
+        self._seed_items = seed_items  # 今日缓存，用于增量抓取
 
     def run(self):
         try:
             if self._source_url:
                 items = self._collector.fetch_from_source(self._source_url)
+                self.finished.emit(items)
             else:
-                items = self._collector.fetch_all()
-            self.finished.emit(items)
+                # 逐源抓取，每完成一个源就发出中间结果；传入缓存作为种子
+                def _on_source(current_items):
+                    self.items_fetched.emit(current_items)
+
+                final = self._collector.fetch_all_progressive(
+                    _on_source, seed_items=self._seed_items
+                )
+                self.finished.emit(final)
         except Exception as e:
             self.error.emit(str(e))
 
 
 class VectorWorker(QThread):
-    """异步向量化 + 聚类线程"""
-    clusters_ready = pyqtSignal(list)        # list of cluster dicts
+    """异步向量化 + 聚类线程（英文/中文分别聚类）"""
+    clusters_ready = pyqtSignal(list, list)  # en_clusters, zh_clusters
     error = pyqtSignal(str)
+
+    # 聚类所需的最小文章数（低于此值跳过聚类，降低以避免中文侧长期空白）
+    _MIN_ITEMS_FOR_CLUSTER = 3
 
     def __init__(self, news_items, parent=None):
         super().__init__(parent)
         self._news_items = news_items
+        self._cancelled = False  # 取消标志，替代 terminate()
+
+    def cancel(self):
+        """请求取消当前任务（线程将在下一个检查点退出）"""
+        self._cancelled = True
 
     def run(self):
         try:
             from news_analyzer.processing.vectorizer import NewsVectorizer
             from news_analyzer.processing.clusterer import NewsClusterer
 
-            if not self._news_items:
-                self.clusters_ready.emit([])
+            if not self._news_items or self._cancelled:
+                self.clusters_ready.emit([], [])
                 return
 
-            vectorizer = NewsVectorizer()
-            matrix = vectorizer.fit_transform(self._news_items)
-            if matrix is None or matrix.shape[0] == 0:
-                self.clusters_ready.emit([])
+            en_items = [n for n in self._news_items if n.get('lang', 'en') == 'en']
+            zh_items = [n for n in self._news_items if n.get('lang', 'en') == 'zh']
+
+            en_clusters = self._cluster_items(
+                en_items, NewsVectorizer, NewsClusterer, self._MIN_ITEMS_FOR_CLUSTER
+            )
+
+            if self._cancelled:
+                self.clusters_ready.emit([], [])
                 return
 
-            feature_names = vectorizer.get_feature_names()
-            clusterer = NewsClusterer()
-            clusters = clusterer.cluster(matrix, self._news_items, feature_names)
-            self.clusters_ready.emit(clusters)
+            zh_clusters = self._cluster_items(
+                zh_items, NewsVectorizer, NewsClusterer, self._MIN_ITEMS_FOR_CLUSTER
+            )
+
+            if not self._cancelled:
+                self.clusters_ready.emit(en_clusters, zh_clusters)
 
         except ImportError:
             self.error.emit(
@@ -101,6 +125,18 @@ class VectorWorker(QThread):
             )
         except Exception as e:
             self.error.emit(str(e))
+
+    @staticmethod
+    def _cluster_items(items, VectorizerClass, ClustererClass, min_items: int = 3):
+        if len(items) < min_items:
+            return []
+        vectorizer = VectorizerClass()
+        matrix = vectorizer.fit_transform(items)
+        if matrix is None or matrix.shape[0] == 0:
+            return []
+        feature_names = vectorizer.get_feature_names()
+        clusterer = ClustererClass()
+        return clusterer.cluster(matrix, items, feature_names)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +199,7 @@ class MainWindow(QMainWindow):
         self._vector_worker = None
         self._current_news_items = []
         self._current_clusters = []
+        self._last_selected_news = None
 
         self.setWindowTitle("新闻聚合与分析系统")
         self.setMinimumSize(1280, 800)
@@ -192,9 +229,38 @@ class MainWindow(QMainWindow):
 
         self.logger.info("主窗口已初始化")
 
+        # 优先加载今日缓存（立即显示，无需等待网络）
+        self._load_today_cache()
+
+        # 启动后自动增量刷新一次（延迟 800ms 确保 UI 渲染完成）
+        QTimer.singleShot(800, self.refresh_news)
+
+        # 每 5 分钟自动刷新
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(5 * 60 * 1000)
+        self._auto_refresh_timer.timeout.connect(self.refresh_news)
+        self._auto_refresh_timer.start()
+
     # ------------------------------------------------------------------
     # 初始化辅助
     # ------------------------------------------------------------------
+
+    def _load_today_cache(self):
+        """启动时加载今日新闻缓存，立即填充 UI，等待增量刷新覆盖"""
+        try:
+            cached = self.storage.load_today_news()
+            if not cached:
+                return
+            self._current_news_items = cached
+            self.news_list.update_news(cached)
+            self.chat_panel.set_available_news_titles(cached)
+            self._start_vector_worker(cached)
+            self.status_label.setText(f"已从缓存加载 {len(cached)} 条今日新闻")
+            self.logger.info(f"今日缓存加载完成：{len(cached)} 条")
+            # 顺带清理 3 天前的旧缓存文件
+            self.storage.cleanup_old_today_cache(keep_days=3)
+        except Exception as e:
+            self.logger.warning(f"今日缓存加载失败: {e}")
 
     def _init_hot_news_manager(self):
         try:
@@ -302,6 +368,9 @@ class MainWindow(QMainWindow):
                 self.topic_detail_panel.bookmark_toggled.connect(
                     self._on_bookmark_toggled
                 )
+                self.topic_detail_panel.back_requested.connect(
+                    self._on_topic_detail_back
+                )
                 splitter.addWidget(self.topic_detail_panel)
                 self.topic_detail_panel.hide()
                 splitter.setSizes([1, 0])
@@ -316,7 +385,12 @@ class MainWindow(QMainWindow):
         return tab
 
     def _build_news_tab(self) -> QWidget:
-        """构建新闻标签页：原有 SearchPanel + Splitter 布局"""
+        """构建新闻标签页：SearchPanel + 三栏 Splitter（侧边栏 | 新闻列表 | 右侧面板）
+
+        右侧面板使用 QStackedWidget：
+          页面 0 — NewsReaderWidget（默认，显示原文）
+          页面 1 — QTabWidget（聊天 + 分析），顶部带"← 返回阅读"按钮
+        """
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -340,22 +414,56 @@ class MainWindow(QMainWindow):
         self.news_list.news_updated.connect(self._update_chat_panel_news)
         splitter.addWidget(self.news_list)
 
-        # 右侧聊天/分析标签页
-        self.right_panel = QTabWidget()
+        # 右侧：QStackedWidget（阅读器 / 聊天分析）
+        self.right_stack = QStackedWidget()
 
+        # 页面 0：新闻阅读器（默认）
+        try:
+            from news_analyzer.ui.news_reader import NewsReaderWidget
+            self.news_reader = NewsReaderWidget()
+            self.news_reader.analyze_requested.connect(self._switch_to_analysis)
+        except Exception as e:
+            self.logger.error(f"NewsReaderWidget 加载失败: {e}")
+            self.news_reader = QLabel("阅读器加载失败")
+        self.right_stack.addWidget(self.news_reader)  # index 0
+
+        # 页面 1：聊天/分析 Tab（带返回按钮的容器）
+        analysis_container = QWidget()
+        ac_layout = QVBoxLayout(analysis_container)
+        ac_layout.setContentsMargins(0, 0, 0, 0)
+        ac_layout.setSpacing(0)
+
+        back_to_reader_btn = QPushButton("← 返回阅读")
+        back_to_reader_btn.setFixedHeight(28)
+        back_to_reader_btn.clicked.connect(self._switch_to_reader)
+        ac_layout.addWidget(back_to_reader_btn)
+
+        self.right_panel = QTabWidget()
         self.chat_panel = ChatPanel()
         self.chat_panel.llm_client = self.llm_client
-
         self.llm_panel = LLMPanel()
         self.llm_panel.llm_client = self.llm_client
-
         self.right_panel.addTab(self.chat_panel, "聊天")
         self.right_panel.addTab(self.llm_panel, "分析")
-        splitter.addWidget(self.right_panel)
+        ac_layout.addWidget(self.right_panel, 1)
 
+        self.right_stack.addWidget(analysis_container)  # index 1
+
+        splitter.addWidget(self.right_stack)
         splitter.setSizes([200, 500, 500])
         layout.addWidget(splitter, 1)
         return tab
+
+    def _switch_to_analysis(self):
+        """切换右侧面板到聊天/分析视图，并触发 LLM 分析当前新闻"""
+        self.right_stack.setCurrentIndex(1)
+        self.right_panel.setCurrentIndex(1)     # 打开"分析" Tab
+        if hasattr(self, '_last_selected_news') and self._last_selected_news:
+            self.llm_panel.analyze_news(self._last_selected_news)
+
+    def _switch_to_reader(self):
+        """切换右侧面板回新闻阅读视图"""
+        self.right_stack.setCurrentIndex(0)
 
     def _build_tracking_tab(self) -> QWidget:
         """构建追踪标签页"""
@@ -520,10 +628,22 @@ class MainWindow(QMainWindow):
         self.status_label.setText("正在获取新闻...")
         self.refresh_action.setEnabled(False)
 
-        self._fetch_worker = FetchWorker(self.rss_collector, source_url, self)
+        # 传入今日缓存作为种子，实现增量抓取
+        seed = self._current_news_items if self._current_news_items else None
+        self._fetch_worker = FetchWorker(
+            self.rss_collector, source_url, seed_items=seed, parent=self
+        )
+        self._fetch_worker.items_fetched.connect(self._on_partial_fetch)
         self._fetch_worker.finished.connect(self._on_fetch_finished)
         self._fetch_worker.error.connect(self._on_fetch_error)
         self._fetch_worker.start()
+
+    def _on_partial_fetch(self, news_items: list):
+        """每完成一个 RSS 源后实时更新新闻列表（不触发聚类）"""
+        self._current_news_items = news_items
+        count = len(news_items)
+        self.status_label.setText(f"正在获取… 已获取 {count} 条")
+        self.news_list.update_news(news_items)
 
     def _on_fetch_finished(self, news_items):
         self.refresh_action.setEnabled(True)
@@ -531,17 +651,17 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"已获取 {count} 条新闻")
         self._current_news_items = news_items
 
-        # 更新新闻列表 UI
-        self.news_list.update_news(news_items)
+        # 新闻列表已由 _on_partial_fetch 实时更新，此处仅同步聊天面板标题缓存
         self.chat_panel.set_available_news_titles(news_items)
 
-        # 保存到存储
+        # 保存到存储（常规时间戳文件 + 今日缓存）
         self.storage.save_news(news_items)
+        self.storage.save_today_news(news_items)
 
         # 触发向量化/聚类（异步）
         self._start_vector_worker(news_items)
 
-        # 更新热点数据（用上次聚类结果，若无则传空）
+        # 更新热点数据（用上次聚类结果的合并列表，若无则传空）
         if self.hot_news_manager:
             self.hot_news_manager.update_daily_hot(news_items, self._current_clusters)
 
@@ -559,7 +679,9 @@ class MainWindow(QMainWindow):
 
     def _start_vector_worker(self, news_items):
         if self._vector_worker and self._vector_worker.isRunning():
-            self._vector_worker.terminate()
+            # 用取消标志替代 terminate()，让线程在检查点自然退出
+            self._vector_worker.cancel()
+            self._vector_worker.wait(3000)   # 最多等待 3s，避免永久阻塞
 
         if self.dashboard_panel:
             self.dashboard_panel.set_loading(True)
@@ -569,11 +691,11 @@ class MainWindow(QMainWindow):
         self._vector_worker.error.connect(self._on_vector_error)
         self._vector_worker.start()
 
-    def _on_clusters_ready(self, clusters):
-        self._current_clusters = clusters
+    def _on_clusters_ready(self, en_clusters, zh_clusters):
+        self._current_clusters = en_clusters + zh_clusters
         if self.dashboard_panel:
-            self.dashboard_panel.refresh(self._current_news_items, clusters)
-        self.logger.info(f"聚类完成，共 {len(clusters)} 个话题")
+            self.dashboard_panel.refresh(self._current_news_items, en_clusters, zh_clusters)
+        self.logger.info(f"聚类完成：英文 {len(en_clusters)} 个话题，中文 {len(zh_clusters)} 个话题")
 
     def _on_vector_error(self, msg):
         if self.dashboard_panel:
@@ -606,6 +728,12 @@ class MainWindow(QMainWindow):
         total = sum(self._home_splitter.sizes())
         self._home_splitter.setSizes([int(total * 0.6), int(total * 0.4)])
 
+    def _on_topic_detail_back(self):
+        """从话题详情返回仪表盘"""
+        if self.topic_detail_panel:
+            self.topic_detail_panel.hide()
+        self._home_splitter.setSizes([1, 0])
+
     def _on_topic_news_selected(self, news_item: dict):
         """从话题详情点击新闻 → 切换到"新闻"页并选中"""
         self.main_tabs.setCurrentIndex(1)
@@ -621,7 +749,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_news_selected(self, news_item):
-        self.llm_panel.analyze_news(news_item)
+        self._last_selected_news = news_item
+        # 更新阅读器并切回阅读视图（仅当用户没有主动停留在分析页面时才切换）
+        if hasattr(self, 'news_reader'):
+            self.news_reader.set_news(news_item)
+        if hasattr(self, 'right_stack') and self.right_stack.currentIndex() != 1:
+            self.right_stack.setCurrentIndex(0)
+        # 同步聊天/分析面板的上下文（不触发分析，等用户主动点击）
         self.chat_panel.set_current_news(news_item)
         if hasattr(self.chat_panel, 'context_checkbox'):
             self.chat_panel.context_checkbox.setChecked(True)
@@ -719,7 +853,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "设置", "设置功能开发中...")
 
     def _show_llm_settings(self):
-        dialog = LLMSettingsDialog(self)
+        dialog = LLMSettingsDialog(
+            self,
+            rss_collector=self.rss_collector,
+            llm_client=self.llm_client,
+        )
         if dialog.exec_():
             dialog.save_settings()
             self._load_llm_settings()
